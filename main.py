@@ -6,6 +6,7 @@ import threading
 import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from fuzzywuzzy import process
 from requests.adapters import HTTPAdapter
 from urllib.parse import quote
 from urllib3.util.retry import Retry
@@ -136,68 +137,84 @@ def get_available_consoles(root):
     print(f"Found {len(console_list)} consoles in {scan_time:.2f} seconds.")
     return console_list
 
-def select_consoles(available_consoles):
+def select_console(available_consoles):
     print("\nAvailable consoles:")
     for i, console in enumerate(available_consoles, 1):
         print(f"{i}. {console}")
     
-    selected_indices = input("\nEnter the numbers of the consoles you want to process (comma-separated, or 'all'): ")
-    
-    if selected_indices.lower() == 'all':
-        return available_consoles
-    
-    selected_consoles = []
-    for index in selected_indices.split(','):
+    while True:
         try:
-            i = int(index.strip()) - 1
-            if 0 <= i < len(available_consoles):
-                selected_consoles.append(available_consoles[i])
+            choice = int(input("\nEnter the number of the console you want to process: "))
+            if 1 <= choice <= len(available_consoles):
+                return available_consoles[choice - 1]
+            else:
+                print("Invalid choice. Please try again.")
         except ValueError:
-            pass
-    
-    return selected_consoles
+            print("Invalid input. Please enter a number.")
 
-def process_game_images(root, output_dir, selected_consoles, max_workers=10, max_retries=3):
-    print("\nFiltering games for selected consoles...")
-    start_time = time.time()
-    
-    selected_games = {}
-    total_games = 0
-    
+def fuzzy_search_games(games, query):
+    game_names = [game['name'] for game in games]
+    results = process.extract(query, game_names, limit=5)
+    return [games[game_names.index(result[0])] for result in results]
+
+def select_games(root, selected_console):
+    print(f"\nGathering games for {selected_console}...")
+    games = []
     for game in root.findall('.//Game'):
-        total_games += 1
-        if total_games % 1000 == 0:
-            print(f"Processed {total_games} games...")
-        
         platform = game.find('Platform')
-        if platform is not None and platform.text and platform.text.strip() in selected_consoles:
-            database_id = game.find('DatabaseID')
+        if platform is not None and platform.text and platform.text.strip() == selected_console:
             name = game.find('Name')
-            if database_id is not None and database_id.text and name is not None and name.text:
-                selected_games[database_id.text] = {
-                    'platform': sanitize_filename(platform.text.strip()),
-                    'name': sanitize_filename(name.text.strip())
-                }
+            database_id = game.find('DatabaseID')
+            if name is not None and name.text and database_id is not None and database_id.text:
+                games.append({
+                    'name': name.text.strip(),
+                    'database_id': database_id.text,
+                    'platform': selected_console
+                })
     
-    filter_time = time.time() - start_time
-    print(f"Filtered {len(selected_games)} games from {total_games} total games in {filter_time:.2f} seconds.")
+    print(f"Found {len(games)} games for {selected_console}")
     
-    print("\nCollecting images for selected games...")
-    start_time = time.time()
+    while True:
+        choice = input("\nDo you want to (1) search for a specific game or (2) process all games? Enter 1 or 2: ")
+        if choice == '1':
+            query = input("Enter your search query: ")
+            results = fuzzy_search_games(games, query)
+            print("\nTop 5 matches:")
+            for i, game in enumerate(results, 1):
+                print(f"{i}. {game['name']}")
+            while True:
+                try:
+                    selection = int(input("\nEnter the number of the game you want to process (or 0 to search again): "))
+                    if 0 <= selection <= len(results):
+                        if selection == 0:
+                            break
+                        return [results[selection - 1]]
+                    else:
+                        print("Invalid choice. Please try again.")
+                except ValueError:
+                    print("Invalid input. Please enter a number.")
+        elif choice == '2':
+            return games
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+def process_game_images(root, output_dir, games, max_workers=10, max_retries=3):
+    print(f"\nPreparing to process images for {len(games)} games...")
+    
     image_queue = deque()
-    total_images = 0
+    for game in games:
+        for image in root.findall(f".//GameImage[DatabaseID='{game['database_id']}']"):
+            image_queue.append((image, {
+                'platform': game['platform'],
+                'name': sanitize_filename(game['name'])
+            }))
     
-    for image in root.findall('.//GameImage'):
-        total_images += 1
-        if total_images % 1000 == 0:
-            print(f"Processed {total_images} images...")
-        
-        database_id = safe_find_text(image, 'DatabaseID')
-        if database_id in selected_games:
-            image_queue.append((image, selected_games[database_id]))
+    total_images = len(image_queue)
+    print(f"Found {total_images} images to process.")
     
-    collection_time = time.time() - start_time
-    print(f"Collected {len(image_queue)} images from {total_images} total images in {collection_time:.2f} seconds.")
+    if total_images == 0:
+        print("No images to process. Exiting.")
+        return
     
     print("\nStarting image download process...")
     start_time = time.time()
@@ -205,7 +222,7 @@ def process_game_images(root, output_dir, selected_consoles, max_workers=10, max
     file_cache = FileExistenceCache()
     
     progress = {'completed': 0, 'lock': threading.Lock()}
-    progress_thread = threading.Thread(target=print_progress, args=(progress, len(image_queue), start_time))
+    progress_thread = threading.Thread(target=print_progress, args=(progress, total_images, start_time))
     progress_thread.start()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -220,8 +237,8 @@ def process_game_images(root, output_dir, selected_consoles, max_workers=10, max
     progress_thread.join()
     
     total_time = time.time() - start_time
-    print(f"\nCompleted downloading {len(image_queue)} images in {total_time:.2f} seconds.")
-    print(f"Average download speed: {len(image_queue) / total_time:.2f} images/second")
+    print(f"\nCompleted processing {total_images} images in {total_time:.2f} seconds.")
+    print(f"Average speed: {total_images / total_time:.2f} images/second")
     
 def main():
     xml_file = 'Metadata.xml'
@@ -229,14 +246,14 @@ def main():
     
     root = parse_xml(xml_file)
     available_consoles = get_available_consoles(root)
-    selected_consoles = select_consoles(available_consoles)
+    selected_console = select_console(available_consoles)
+    selected_games = select_games(root, selected_console)
     
-    if not selected_consoles:
-        print("No consoles selected. Exiting.")
+    if not selected_games:
+        print("No games selected. Exiting.")
         return
     
-    print(f"\nProcessing images for the following consoles: {', '.join(selected_consoles)}")
-    process_game_images(root, output_dir, selected_consoles, max_workers=20, max_retries=3)
+    process_game_images(root, output_dir, selected_games, max_workers=20, max_retries=3)
 
 if __name__ == "__main__":
     main()
